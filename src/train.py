@@ -305,34 +305,6 @@ def train_epiaml(
         dropout=dropout  # Use configurable dropout
     ).to(device)
 
-    # Print model comparison
-    print(f"\n{'='*70}")
-    print(f"MODEL COMPARISON")
-    print(f"{'='*70}")
-
-    # Import MARLIN model for comparison
-    import sys
-    marlin_path = os.path.join(os.path.dirname(__file__), '../../pytorch_marlin/src')
-    if os.path.exists(marlin_path):
-        sys.path.insert(0, marlin_path)
-        try:
-            from model import MARLINModel
-            marlin_model = MARLINModel(
-                input_size=input_size,
-                output_size=num_classes
-            )
-            marlin_params = sum(p.numel() for p in marlin_model.parameters() if p.requires_grad)
-
-            print(f"\nMARLIN (pytorch_marlin/):")
-            print(f"  Architecture: 2-layer MLP (256 → 128)")
-            print(f"  Total parameters: {marlin_params:,}")
-            print(f"  Model size: ~{marlin_params * 4 / (1024**2):.2f} MB")
-
-            del marlin_model
-        except ImportError:
-            print(f"\nMARLIN model not found at {marlin_path}")
-        sys.path.pop(0)
-
     epiaml_params = model.get_num_parameters()
     print(f"\nEpiAML (EpiAML/):")
     print(f"  Architecture: 1D-CNN + Attention + Contrastive Learning")

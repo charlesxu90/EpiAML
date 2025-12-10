@@ -40,6 +40,8 @@ try:
     import cupy as cp
     from cuml.decomposition import PCA as cuPCA
     from cuml.preprocessing import StandardScaler as cuStandardScaler
+    from cuml.neighbors import NearestNeighbors as cuNearestNeighbors
+    from cuml.metrics import pairwise_distances as cu_pairwise_distances
     USE_GPU_AVAILABLE = True
 except ImportError:
     USE_GPU_AVAILABLE = False
@@ -142,12 +144,18 @@ def reduce_dimensions(feature_data, n_components=50, batch_size=None):
     return reduced, pca
 
 
-def compute_distance_matrix(feature_repr, metric='correlation', n_neighbors=None):
+def compute_distance_matrix(feature_repr, metric='correlation', n_neighbors=None, use_gpu=None):
     """Compute pairwise distances efficiently using sparse k-NN."""
+    global USE_GPU
+    if use_gpu is None:
+        use_gpu = USE_GPU
+    
     n_features = feature_repr.shape[0]
     
     print(f"\nComputing distance matrix ({metric})...")
     print(f"  Features: {n_features}")
+    if use_gpu:
+        print(f"  Using GPU (cuML) for distance computation")
     
     start = time.time()
     
@@ -170,32 +178,59 @@ def compute_distance_matrix(feature_repr, metric='correlation', n_neighbors=None
         # Limit k to available features
         k = min(n_neighbors, n_features - 1)
         
-        # Choose algorithm based on metric (ball_tree doesn't support correlation)
-        if metric == 'correlation':
-            # Use brute force for correlation or convert to cosine on normalized data
-            print(f"  Note: Using 'brute' algorithm for correlation metric...")
-            nn = NearestNeighbors(n_neighbors=k, metric=metric, n_jobs=-1, algorithm='brute')
-        elif metric in ['euclidean', 'manhattan', 'chebyshev', 'minkowski']:
-            nn = NearestNeighbors(n_neighbors=k, metric=metric, n_jobs=-1, algorithm='ball_tree')
-        else:
-            # For other metrics, let sklearn choose the best algorithm
-            nn = NearestNeighbors(n_neighbors=k, metric=metric, n_jobs=-1, algorithm='auto')
+        # Use GPU-accelerated kNN if available and requested
+        if use_gpu and USE_GPU_AVAILABLE:
+            try:
+                print(f"  Using GPU (cuML) for kNN computation...")
+                # Convert to CuPy array
+                feature_repr_gpu = cp.asarray(feature_repr)
+                
+                # cuML NearestNeighbors
+                nn = cuNearestNeighbors(n_neighbors=k, metric=metric)
+                nn.fit(feature_repr_gpu)
+                
+                print(f"  Computing {n_features:,} × {k} nearest neighbors on GPU...")
+                distances, indices = nn.kneighbors(feature_repr_gpu)
+                
+                # Convert back to numpy
+                distances = cp.asnumpy(distances)
+                indices = cp.asnumpy(indices)
+                
+                # Free GPU memory
+                del feature_repr_gpu
+                cp.get_default_memory_pool().free_all_blocks()
+                
+            except Exception as e:
+                print(f"  GPU kNN failed ({e}), falling back to CPU...")
+                use_gpu = False
         
-        print(f"  Fitting kNN index on {n_features:,} features...")
-        nn.fit(feature_repr)
-        
-        print(f"  Computing {n_features:,} × {k} nearest neighbors...")
-        # Process in batches with progress bar
-        batch_size = 10000
-        distances_list = []
-        indices_list = []
-        for i in tqdm(range(0, n_features, batch_size), desc="  kNN queries", unit="batch"):
-            end_i = min(i + batch_size, n_features)
-            dist_batch, ind_batch = nn.kneighbors(feature_repr[i:end_i])
-            distances_list.append(dist_batch)
-            indices_list.append(ind_batch)
-        distances = np.vstack(distances_list)
-        indices = np.vstack(indices_list)
+        if not use_gpu or not USE_GPU_AVAILABLE:
+            # Choose algorithm based on metric (ball_tree doesn't support correlation)
+            if metric == 'correlation':
+                # Use brute force for correlation or convert to cosine on normalized data
+                print(f"  Note: Using 'brute' algorithm for correlation metric...")
+                nn = NearestNeighbors(n_neighbors=k, metric=metric, n_jobs=-1, algorithm='brute')
+            elif metric in ['euclidean', 'manhattan', 'chebyshev', 'minkowski']:
+                nn = NearestNeighbors(n_neighbors=k, metric=metric, n_jobs=-1, algorithm='ball_tree')
+            else:
+                # For other metrics, let sklearn choose the best algorithm
+                nn = NearestNeighbors(n_neighbors=k, metric=metric, n_jobs=-1, algorithm='auto')
+            
+            print(f"  Fitting kNN index on {n_features:,} features...")
+            nn.fit(feature_repr)
+            
+            print(f"  Computing {n_features:,} × {k} nearest neighbors...")
+            # Process in batches with progress bar
+            batch_size = 10000
+            distances_list = []
+            indices_list = []
+            for i in tqdm(range(0, n_features, batch_size), desc="  kNN queries", unit="batch"):
+                end_i = min(i + batch_size, n_features)
+                dist_batch, ind_batch = nn.kneighbors(feature_repr[i:end_i])
+                distances_list.append(dist_batch)
+                indices_list.append(ind_batch)
+            distances = np.vstack(distances_list)
+            indices = np.vstack(indices_list)
         
         print(f"  Converting to dense matrix...")
         rows = np.repeat(np.arange(n_features), distances.shape[1])
@@ -221,7 +256,25 @@ def compute_distance_matrix(feature_repr, metric='correlation', n_neighbors=None
         print(f"  Sparsity: {100.0 * (1 - dist_matrix.nnz / (n_features * n_features)):.1f}%")
     else:
         print(f"  Computing full pairwise distance matrix...")
-        dist_matrix = pairwise_distances(feature_repr, metric=metric, n_jobs=-1)
+        
+        # Use GPU for full distance matrix if available
+        if use_gpu and USE_GPU_AVAILABLE:
+            try:
+                print(f"  Using GPU (cuML) for pairwise distances...")
+                feature_repr_gpu = cp.asarray(feature_repr)
+                dist_matrix_gpu = cu_pairwise_distances(feature_repr_gpu, metric=metric)
+                dist_matrix = cp.asnumpy(dist_matrix_gpu)
+                
+                # Free GPU memory
+                del feature_repr_gpu, dist_matrix_gpu
+                cp.get_default_memory_pool().free_all_blocks()
+                
+            except Exception as e:
+                print(f"  GPU pairwise distances failed ({e}), falling back to CPU...")
+                dist_matrix = pairwise_distances(feature_repr, metric=metric, n_jobs=-1)
+        else:
+            dist_matrix = pairwise_distances(feature_repr, metric=metric, n_jobs=-1)
+        
         print(f"  Distance matrix computed in {time.time()-start:.1f}s")
         print(f"  Shape: {dist_matrix.shape}, dtype: {dist_matrix.dtype}")
         print(f"  Memory used: ~{dist_matrix.nbytes / 1e9:.2f} GB")
@@ -241,8 +294,12 @@ def compute_distance_matrix(feature_repr, metric='correlation', n_neighbors=None
     return dist_matrix
 
 
-def order_by_nearest_neighbor(dist_matrix, start_idx=None):
+def order_by_nearest_neighbor(dist_matrix, start_idx=None, use_gpu=None):
     """Order features using nearest neighbor heuristic (greedy TSP)."""
+    global USE_GPU
+    if use_gpu is None:
+        use_gpu = USE_GPU
+    
     n_features = dist_matrix.shape[0]
     
     print(f"\nOrdering {n_features:,} features with nearest neighbor heuristic...")
@@ -256,36 +313,113 @@ def order_by_nearest_neighbor(dist_matrix, start_idx=None):
     
     start_time = time.time()
     
-    if start_idx is None:
-        print(f"  Finding best start node...")
-        if is_sparse:
-            # For sparse, compute sum differently
-            start_idx = np.argmin(np.array(dist_matrix.sum(axis=1)).flatten())
-        else:
-            start_idx = np.argmin(dist_matrix.sum(axis=1))
-    
-    print(f"  Starting from feature {start_idx}")
-    
-    visited = np.zeros(n_features, dtype=bool)
-    order = np.zeros(n_features, dtype=int)
-    
-    current = start_idx
-    order[0] = current
-    visited[current] = True
-    
-    for i in tqdm(range(1, n_features), desc="  Building feature order", unit="features"):
-        # Get distances from current feature
-        if is_sparse:
-            distances = dist_matrix.getrow(current).toarray().flatten().copy()
-        else:
-            distances = dist_matrix[current].copy()
+    # GPU acceleration for both dense and sparse matrices
+    if use_gpu and USE_GPU_AVAILABLE:
+        try:
+            if is_sparse:
+                print(f"  Using GPU (CuPy) with sparse matrix operations...")
+                # For sparse: GPU overhead per-iteration is too high, only use GPU for initial find
+                # Convert visited to GPU once, reuse it
+                visited_gpu = cp.zeros(n_features, dtype=bool)
+                
+                if start_idx is None:
+                    print(f"  Finding best start node...")
+                    start_idx = np.argmin(np.array(dist_matrix.sum(axis=1)).flatten())
+                
+                print(f"  Starting from feature {start_idx}")
+                
+                visited = np.zeros(n_features, dtype=bool)
+                order = np.zeros(n_features, dtype=int)
+                
+                current = start_idx
+                order[0] = current
+                visited[current] = True
+                visited_gpu[current] = True
+                
+                # For sparse matrices, CPU is actually faster due to low GPU transfer overhead per row
+                # GPU transfer cost >> sparse row extraction + argmin cost
+                # So we use CPU path but keep same interface
+                print(f"  Note: CPU path faster for sparse matrices (minimal GPU transfer overhead)")
+                for i in tqdm(range(1, n_features), desc="  Building feature order", unit="features"):
+                    # Get row from sparse matrix (CPU is faster for this)
+                    distances = dist_matrix.getrow(current).toarray().flatten().copy()
+                    distances[visited] = np.inf
+                    nearest = np.argmin(distances)
+                    
+                    order[i] = nearest
+                    visited[nearest] = True
+                    current = nearest
+                
+                # Free GPU memory
+                del visited_gpu
+                cp.get_default_memory_pool().free_all_blocks()
+                
+            else:
+                print(f"  Using GPU (CuPy) for dense matrix operations...")
+                dist_matrix_gpu = cp.asarray(dist_matrix)
+                
+                if start_idx is None:
+                    print(f"  Finding best start node on GPU...")
+                    start_idx = int(cp.argmin(cp.sum(dist_matrix_gpu, axis=1)))
+                
+                print(f"  Starting from feature {start_idx}")
+                
+                visited_gpu = cp.zeros(n_features, dtype=bool)
+                order = np.zeros(n_features, dtype=int)
+                
+                current = start_idx
+                order[0] = current
+                visited_gpu[current] = True
+                
+                for i in tqdm(range(1, n_features), desc="  Building feature order (GPU)", unit="features"):
+                    distances = dist_matrix_gpu[current].copy()
+                    distances[visited_gpu] = cp.inf
+                    nearest = int(cp.argmin(distances))
+                    
+                    order[i] = nearest
+                    visited_gpu[nearest] = True
+                    current = nearest
+                
+                # Free GPU memory
+                del dist_matrix_gpu, visited_gpu
+                cp.get_default_memory_pool().free_all_blocks()
         
-        distances[visited] = np.inf
-        nearest = np.argmin(distances)
+        except Exception as e:
+            print(f"  GPU ordering failed ({e}), falling back to CPU...")
+            use_gpu = False
+    
+    # CPU-only path
+    if not use_gpu:
+        if start_idx is None:
+            print(f"  Finding best start node...")
+            if is_sparse:
+                # For sparse, compute sum differently
+                start_idx = np.argmin(np.array(dist_matrix.sum(axis=1)).flatten())
+            else:
+                start_idx = np.argmin(dist_matrix.sum(axis=1))
         
-        order[i] = nearest
-        visited[nearest] = True
-        current = nearest
+        print(f"  Starting from feature {start_idx}")
+        
+        visited = np.zeros(n_features, dtype=bool)
+        order = np.zeros(n_features, dtype=int)
+        
+        current = start_idx
+        order[0] = current
+        visited[current] = True
+        
+        for i in tqdm(range(1, n_features), desc="  Building feature order", unit="features"):
+            # Get distances from current feature
+            if is_sparse:
+                distances = dist_matrix.getrow(current).toarray().flatten().copy()
+            else:
+                distances = dist_matrix[current].copy()
+            
+            distances[visited] = np.inf
+            nearest = np.argmin(distances)
+            
+            order[i] = nearest
+            visited[nearest] = True
+            current = nearest
     
     total_time = time.time() - start_time
     print(f"  Nearest neighbor ordering completed in {total_time:.1f}s")
@@ -507,62 +641,247 @@ def load_sparse_cache(output_dir, prefix='distance_cache'):
 
 
 def plot_ordering_analysis(dist_matrix, order, feature_data, output_dir):
-    """Plot analysis of the feature ordering."""
+    """Plot analysis of the feature ordering with distance distributions."""
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"\nGenerating ordering analysis plots...")
     
     n = len(order)
+    is_sparse = isinstance(dist_matrix, (csr_matrix,)) or hasattr(dist_matrix, 'getrow')
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    # Compute consecutive distances efficiently
+    print(f"  Computing consecutive distances...")
+    consecutive_dists = []
+    for i in range(n-1):
+        if is_sparse:
+            d = dist_matrix[order[i], order[i+1]]
+            if isinstance(d, np.matrix):
+                d = float(d.item())
+            else:
+                d = float(d)
+        else:
+            d = float(dist_matrix[order[i], order[i+1]])
+        consecutive_dists.append(d)
+    consecutive_dists = np.array(consecutive_dists)
     
-    # Plot 1: Consecutive distances with smoothing
-    consecutive_dists = [dist_matrix[order[i], order[i+1]] for i in range(n-1)]
+    # Sample distances for distribution analysis
+    print(f"  Sampling distances for distribution analysis...")
+    if is_sparse:
+        # For sparse matrix, sample random pairs and their distances
+        sample_size = min(50000, n * 10)
+        sample_distances = []
+        for _ in range(sample_size):
+            i = np.random.randint(0, n)
+            j = np.random.randint(0, n)
+            if i != j:
+                d = dist_matrix[i, j]
+                if d != 0:  # Only non-zero entries
+                    sample_distances.append(float(d))
+        sample_distances = np.array(sample_distances)
+    else:
+        # For dense matrix, get upper triangle
+        indices = np.triu_indices(n, k=1)
+        sample_distances = dist_matrix[indices]
     
-    window = min(1000, max(100, n // 100))
+    # Create figure with multiple subplots
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+    
+    # Plot 1: Consecutive distances over position with smoothing
+    ax1 = fig.add_subplot(gs[0, :2])
+    window = min(1000, max(100, len(consecutive_dists) // 100))
     smoothed = np.convolve(consecutive_dists, np.ones(window)/window, mode='valid')
+    ax1.plot(range(len(smoothed)), smoothed, linewidth=1.5, alpha=0.8, color='blue')
+    ax1.fill_between(range(len(smoothed)), smoothed, alpha=0.3, color='blue')
+    ax1.set_xlabel('Feature Position', fontsize=12)
+    ax1.set_ylabel('Distance to Next Feature', fontsize=12)
+    ax1.set_title(f'Consecutive Feature Distances (smoothed, window={window})', fontsize=13, fontweight='bold')
+    ax1.axhline(float(np.mean(consecutive_dists)), color='red', linestyle='--', linewidth=2,
+                label=f'Mean: {np.mean(consecutive_dists):.4f}')
+    ax1.axhline(float(np.median(consecutive_dists)), color='green', linestyle='--', linewidth=2,
+                label=f'Median: {np.median(consecutive_dists):.4f}')
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
     
-    axes[0, 0].plot(smoothed, linewidth=0.5, alpha=0.8)
-    axes[0, 0].set_xlabel('Feature Position', fontsize=12)
-    axes[0, 0].set_ylabel('Distance to Next Feature', fontsize=12)
-    axes[0, 0].set_title(f'Consecutive Feature Distances (window={window})', fontsize=14)
-    axes[0, 0].axhline(np.mean(consecutive_dists), color='red', linestyle='--', 
-                       label=f'Mean: {np.mean(consecutive_dists):.4f}')
-    axes[0, 0].legend()
+    # Plot 2: Consecutive distances stats box
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.axis('off')
+    stats_text = f"""CONSECUTIVE DISTANCES
     
-    # Plot 2: Histogram of consecutive distances
-    axes[0, 1].hist(consecutive_dists, bins=100, edgecolor='black', alpha=0.7)
-    axes[0, 1].set_xlabel('Distance', fontsize=12)
-    axes[0, 1].set_ylabel('Frequency', fontsize=12)
-    axes[0, 1].set_title('Distribution of Consecutive Distances', fontsize=14)
-    axes[0, 1].axvline(np.median(consecutive_dists), color='red', linestyle='--',
-                       label=f'Median: {np.median(consecutive_dists):.4f}')
-    axes[0, 1].legend()
+Mean:      {np.mean(consecutive_dists):.6f}
+Median:    {np.median(consecutive_dists):.6f}
+Std Dev:   {np.std(consecutive_dists):.6f}
+Min:       {np.min(consecutive_dists):.6f}
+Max:       {np.max(consecutive_dists):.6f}
+Q25:       {np.percentile(consecutive_dists, 25):.6f}
+Q75:       {np.percentile(consecutive_dists, 75):.6f}
+Sum:       {np.sum(consecutive_dists):.2f}
+Count:     {len(consecutive_dists):,}"""
+    ax2.text(0.1, 0.95, stats_text, transform=ax2.transAxes, fontsize=10,
+            verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
-    # Plot 3: Sampled distance matrix
-    sample_size = min(1000, n)
-    sample_idx = np.linspace(0, n-1, sample_size, dtype=int)
-    sample_order = order[sample_idx]
-    sample_dist = dist_matrix[np.ix_(sample_order, sample_order)]
+    # Plot 3: Histogram of consecutive distances
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.hist(consecutive_dists, bins=100, color='steelblue', edgecolor='black', alpha=0.7)
+    ax3.set_xlabel('Distance', fontsize=11)
+    ax3.set_ylabel('Frequency', fontsize=11)
+    ax3.set_title('Distribution: Consecutive Distances', fontsize=12, fontweight='bold')
+    ax3.axvline(float(np.mean(consecutive_dists)), color='red', linestyle='--', linewidth=2, label='Mean')
+    ax3.axvline(float(np.median(consecutive_dists)), color='green', linestyle='--', linewidth=2, label='Median')
+    ax3.legend(fontsize=9)
+    ax3.grid(True, alpha=0.3, axis='y')
     
-    im = axes[1, 0].imshow(sample_dist, cmap='viridis', aspect='auto')
-    axes[1, 0].set_xlabel('Feature (ordered)', fontsize=12)
-    axes[1, 0].set_ylabel('Feature (ordered)', fontsize=12)
-    axes[1, 0].set_title('Reordered Distance Matrix (sampled)', fontsize=14)
-    plt.colorbar(im, ax=axes[1, 0], label='Distance')
+    # Plot 4: Log-scale histogram of consecutive distances
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.hist(consecutive_dists, bins=100, color='coral', edgecolor='black', alpha=0.7)
+    ax4.set_xlabel('Distance', fontsize=11)
+    ax4.set_ylabel('Frequency (log scale)', fontsize=11)
+    ax4.set_title('Distribution: Consecutive Distances (log scale)', fontsize=12, fontweight='bold')
+    ax4.set_yscale('log')
+    ax4.grid(True, alpha=0.3, which='both')
     
-    # Plot 4: Methylation values
-    sample_data = feature_data[sample_order]
-    im2 = axes[1, 1].imshow(sample_data.T, aspect='auto', cmap='RdBu_r', 
-                            vmin=0, vmax=1, interpolation='nearest')
-    axes[1, 1].set_xlabel('Features (ordered)', fontsize=12)
-    axes[1, 1].set_ylabel('Samples', fontsize=12)
-    axes[1, 1].set_title('Methylation Values (ordered features)', fontsize=14)
-    plt.colorbar(im2, ax=axes[1, 1], label='beta-value')
+    # Plot 5: Histogram of all sampled distances
+    ax5 = fig.add_subplot(gs[1, 2])
+    if len(sample_distances) > 0:
+        ax5.hist(sample_distances, bins=100, color='mediumseagreen', edgecolor='black', alpha=0.7)
+        ax5.set_xlabel('Distance', fontsize=11)
+        ax5.set_ylabel('Frequency', fontsize=11)
+        ax5.set_title(f'Distribution: All Distances\n(sampled, n={len(sample_distances):,})', 
+                     fontsize=12, fontweight='bold')
+        ax5.axvline(float(np.mean(sample_distances)), color='red', linestyle='--', linewidth=2, label='Mean')
+        ax5.axvline(float(np.median(sample_distances)), color='green', linestyle='--', linewidth=2, label='Median')
+        ax5.legend(fontsize=9)
+        ax5.grid(True, alpha=0.3, axis='y')
     
-    plt.tight_layout()
+    # Plot 6: Cumulative distribution of consecutive distances
+    ax6 = fig.add_subplot(gs[2, 0])
+    sorted_dists = np.sort(consecutive_dists)
+    cumsum = np.arange(1, len(sorted_dists) + 1) / len(sorted_dists)
+    ax6.plot(sorted_dists, cumsum, linewidth=2, color='darkblue')
+    ax6.fill_between(sorted_dists, cumsum, alpha=0.3, color='darkblue')
+    ax6.set_xlabel('Distance', fontsize=11)
+    ax6.set_ylabel('Cumulative Probability', fontsize=11)
+    ax6.set_title('CDF: Consecutive Distances', fontsize=12, fontweight='bold')
+    ax6.grid(True, alpha=0.3)
+    
+    # Plot 7: Box plot comparing statistics
+    ax7 = fig.add_subplot(gs[2, 1])
+    data_to_plot = [consecutive_dists]
+    labels_to_use = ['Consecutive']
+    if len(sample_distances) > 0:
+        data_to_plot.append(sample_distances)
+        labels_to_use.append('All Sampled')
+    bp = ax7.boxplot(data_to_plot, patch_artist=True)
+    ax7.set_xticklabels(labels_to_use)
+    for patch, color in zip(bp['boxes'], ['lightblue', 'lightgreen'][:len(bp['boxes'])]):
+        patch.set_facecolor(color)
+    ax7.set_ylabel('Distance', fontsize=11)
+    ax7.set_title('Distribution Comparison', fontsize=12, fontweight='bold')
+    ax7.grid(True, alpha=0.3, axis='y')
+    
+    # Plot 8: Distance matrix visualization (sampled)
+    ax8 = fig.add_subplot(gs[2, 2])
+    sample_size_vis = min(500, n)
+    sample_idx = np.linspace(0, n-1, sample_size_vis, dtype=int)
+    sample_order_idx = order[sample_idx]
+    
+    if is_sparse:
+        # For sparse, create a small dense submatrix
+        sample_dist_dense = dist_matrix[sample_order_idx][:, sample_order_idx].toarray()
+    else:
+        sample_dist_dense = dist_matrix[np.ix_(sample_order_idx, sample_order_idx)]
+    
+    im = ax8.imshow(sample_dist_dense, cmap='YlOrRd', aspect='auto', interpolation='nearest')
+    ax8.set_xlabel('Feature (ordered)', fontsize=11)
+    ax8.set_ylabel('Feature (ordered)', fontsize=11)
+    ax8.set_title(f'Distance Matrix Heatmap\n(sampled {sample_size_vis}×{sample_size_vis})', 
+                 fontsize=12, fontweight='bold')
+    plt.colorbar(im, ax=ax8, label='Distance')
+    
+    # Add overall title
+    fig.suptitle(f'Feature Ordering Analysis: {n:,} features ordered with nearest-neighbor heuristic', 
+                fontsize=14, fontweight='bold', y=0.995)
+    
     plt.savefig(os.path.join(output_dir, 'feature_ordering_analysis.png'), dpi=150, bbox_inches='tight')
     print(f"  Saved: {output_dir}/feature_ordering_analysis.png")
+    plt.close()
+    
+    # Create additional distance distribution summary
+    fig2, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Violin plot
+    parts = axes[0, 0].violinplot([consecutive_dists], positions=[0], widths=0.7, 
+                                   showmeans=True, showmedians=True)
+    axes[0, 0].set_ylabel('Distance', fontsize=11)
+    axes[0, 0].set_title('Violin Plot: Consecutive Distances', fontsize=12, fontweight='bold')
+    axes[0, 0].set_xticks([0])
+    axes[0, 0].set_xticklabels(['Consecutive'])
+    axes[0, 0].grid(True, alpha=0.3, axis='y')
+    
+    # Distance percentiles
+    percentiles = np.linspace(0, 100, 21)
+    percentile_vals = np.percentile(consecutive_dists, percentiles)
+    axes[0, 1].plot(percentiles, percentile_vals, marker='o', linewidth=2, markersize=6, color='darkgreen')
+    axes[0, 1].set_xlabel('Percentile', fontsize=11)
+    axes[0, 1].set_ylabel('Distance', fontsize=11)
+    axes[0, 1].set_title('Percentile Plot: Consecutive Distances', fontsize=12, fontweight='bold')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Distance autocorrelation-like plot (consecutive pairs)
+    if len(consecutive_dists) > 1:
+        axes[1, 0].scatter(consecutive_dists[:-1], consecutive_dists[1:], alpha=0.3, s=10)
+        axes[1, 0].set_xlabel('Distance[i]', fontsize=11)
+        axes[1, 0].set_ylabel('Distance[i+1]', fontsize=11)
+        axes[1, 0].set_title('Consecutive Distance Correlation', fontsize=12, fontweight='bold')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Add correlation coefficient
+        corr = np.corrcoef(consecutive_dists[:-1], consecutive_dists[1:])[0, 1]
+        axes[1, 0].text(0.05, 0.95, f'Correlation: {corr:.4f}', transform=axes[1, 0].transAxes,
+                       fontsize=11, verticalalignment='top',
+                       bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
+    
+    # Summary statistics table
+    axes[1, 1].axis('off')
+    summary_stats = [
+        ['Metric', 'Value'],
+        ['Total Features', f'{n:,}'],
+        ['Consecutive Pairs', f'{len(consecutive_dists):,}'],
+        ['Mean Distance', f'{np.mean(consecutive_dists):.6f}'],
+        ['Median Distance', f'{np.median(consecutive_dists):.6f}'],
+        ['Std Deviation', f'{np.std(consecutive_dists):.6f}'],
+        ['Min Distance', f'{np.min(consecutive_dists):.6f}'],
+        ['Max Distance', f'{np.max(consecutive_dists):.6f}'],
+        ['Total Path Length', f'{np.sum(consecutive_dists):.2f}'],
+        ['Distance Range', f'{np.max(consecutive_dists) - np.min(consecutive_dists):.6f}'],
+    ]
+    
+    table = axes[1, 1].table(cellText=summary_stats, cellLoc='left', loc='center',
+                            colWidths=[0.5, 0.5])
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 2)
+    
+    # Style header row
+    for i in range(2):
+        table[(0, i)].set_facecolor('#4CAF50')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    # Alternate row colors
+    for i in range(1, len(summary_stats)):
+        for j in range(2):
+            if i % 2 == 0:
+                table[(i, j)].set_facecolor('#f0f0f0')
+            else:
+                table[(i, j)].set_facecolor('white')
+    
+    axes[1, 1].set_title('Summary Statistics', fontsize=12, fontweight='bold', pad=20)
+    
+    fig2.suptitle('Distance Distribution Analysis', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'distance_distribution_analysis.png'), dpi=150, bbox_inches='tight')
+    print(f"  Saved: {output_dir}/distance_distribution_analysis.png")
     plt.close()
 
 
@@ -646,7 +965,7 @@ def run_ordering_pipeline(data_path, output_dir='./feature_order_output',
                 'metric': metric,
                 'n_features': len(order),
                 'n_pca_components': n_pca_components,
-                'pca_explained_variance': metadata.get('pca_explained_variance', 'N/A'),
+                'pca_explained_variance': metadata.get('pca_explained_variance', 'N/A') if metadata else 'N/A',
                 'quality_metrics': quality,
                 'runtime_seconds': round(total_time, 2),
                 'loaded_from_cache': True
@@ -681,12 +1000,13 @@ def run_ordering_pipeline(data_path, output_dir='./feature_order_output',
     dist_matrix = compute_distance_matrix(
         feature_repr, 
         metric=metric,
-        n_neighbors=None  # Auto-computed in function
+        n_neighbors=None,  # Auto-computed in function
+        use_gpu=USE_GPU
     )
     
     print(f"\nPerforming feature ordering with method '{method}'...")
     if method == 'nearest_neighbor':
-        order = order_by_nearest_neighbor(dist_matrix)
+        order = order_by_nearest_neighbor(dist_matrix, use_gpu=USE_GPU)
     elif method == 'hierarchical':
         if n_features > 50000:
             print(f"  WARNING: Hierarchical clustering may be very slow for {n_features:,} features.")

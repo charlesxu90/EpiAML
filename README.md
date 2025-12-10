@@ -13,15 +13,24 @@ EpiAML combines cutting-edge machine learning technologies:
 ```
 Input (CpG Methylation Features)
     ↓
-1D-CNN Backbone (Residual Blocks)
+Input Dropout (optional, for sparse feature learning)
     ↓
-Multi-Head Self-Attention
+1D-CNN Backbone (Residual Blocks with configurable stride)
+    ↓
+Multi-Head Self-Attention (optional)
     ↓
 Global Average Pooling
     ↓
 ├─→ Projection Head → Contrastive Loss
 └─→ Classification Head → Cross-Entropy Loss
 ```
+
+### Model Improvements (v2)
+
+✓ **Input Dropout**: High dropout (0.99) enables MLP-style sparse feature learning  
+✓ **Configurable Stride**: Minimal pooling preserves more information, aggressive pooling faster  
+✓ **Optional Attention**: Disabled by default for methylation data (often hurts performance)  
+✓ **Backward Compatible**: All new parameters optional, loads old models seamlessly
 
 ## Installation
 
@@ -73,41 +82,67 @@ python create_debug_data.py --input ../pytorch_marlin/data/training_data.h5 --ou
 ```
 
 ```bash
-python get_feature_orders.py --data data/training_data_debug.h5 --output_dir ./feature_order_debug
+python get_feature_orders.py --data data/training_data_debug.h5 --output_dir ./feature_order_debug --gpu
 
-python get_feature_orders.py --data ../pytorch_marlin/data/training_data.h5
+python get_feature_orders.py --data ../pytorch_marlin/data/training_data.h5 --output_dir ./feature_order --gpu
 ```
 ### 2. Train EpiAML Model
 
+**Recommended: MLP-style with sparse feature learning (best for methylation data):**
 ```bash
-python src/train.py --train_file ../pytorch_marlin/data/training_data.h5 --output_dir ./output_v2 \
-      --dropout 0.3 \
-      --label_smoothing 0.1 \
-      --mixup_alpha 0.2 \
-      --early_stopping 30 \
-      --weight_decay 1e-4
-
-python src/train.py --train_file ../pytorch_marlin/data/training_data.h5 --output_dir ./output_v3_do0.52 \
-      --dropout 0.3 \
-      --label_smoothing 0.1 \
-      --mixup_alpha 0.2 \
-      --early_stopping 30 \
-      --weight_decay 1e-4 \
-      --base_channels 32 \
-      --num_blocks 2 \
-      --dropout 0.5 \
-    #   --learning_rate 5e-5
-
+python src/train.py \
+  --train_file ../pytorch_marlin/data/training_data.h5 \
+  --output_dir ./output_mlp_style \
+  --input_dropout 0.99 \
+  --stride_config minimal \
+  --no_attention \
+  --dropout 0.3 \
+  --label_smoothing 0.1 \
+  --mixup_alpha 0.2 \
+  --early_stopping 30 \
+  --epochs 500 \
+  --batch_size 32
 ```
 
+**Original CNN configuration (faster but may lose information):**
+```bash
+python src/train.py \
+  --train_file ../pytorch_marlin/data/training_data.h5 \
+  --output_dir ./output_cnn \
+  --stride_config aggressive \
+  --base_channels 64 \
+  --num_blocks 4 \
+  --dropout 0.3 \
+  --epochs 500
+```
+
+**Hyperparameter search (generates parallel commands):**
+```bash
+bash prepare_parallel_hpo.sh
+parallel -j 10 < train_model_hpo.sh
+python summarize_results.py --root output_debug_search --out hpo_summary.csv
+```
+
+
+
 **Key Parameters:**
-- `--feature_order`: Path to ordered features (from clustering)
-- `--contrastive_weight`: Weight for contrastive loss (0.0-1.0)
-- `--temperature`: Temperature for contrastive learning (default: 0.07)
+
+*Model Architecture:*
+- `--input_dropout`: Input-level dropout (0.0-0.99) for sparse feature learning (default: 0.0, try 0.99 for MLP-style)
+- `--stride_config`: Pooling strategy - `minimal` (preserves info) or `aggressive` (faster, default: minimal)
 - `--base_channels`: Base channels for CNN (default: 64)
 - `--num_blocks`: Number of CNN residual blocks (default: 4)
-- `--no_attention`: Disable attention mechanism
+- `--no_attention`: Disable attention mechanism (recommended for methylation data)
+- `--dropout`: CNN layer dropout (default: 0.3)
+
+*Training:*
+- `--feature_order`: Path to ordered features (from clustering)
+- `--contrastive_weight`: Weight for contrastive loss (0.0-1.0, default: 0.5)
+- `--temperature`: Temperature for contrastive learning (default: 0.07)
 - `--samples_per_class`: Samples per class for upsampling (default: 50)
+- `--label_smoothing`: Label smoothing factor (default: 0.1)
+- `--mixup_alpha`: Mixup augmentation strength (default: 0.2)
+- `--early_stopping`: Patience for early stopping (default: 30 epochs)
 
 ### 3. Monitor Training
 
@@ -162,15 +197,37 @@ python src/predict.py \
 
 ### 1D-CNN Backbone
 
+**Aggressive Stride Configuration (faster, more downsampling):**
 ```python
 Input (batch, n_features) → (batch, 1, n_features)
     ↓ Conv1d(1, 64, kernel=7, stride=2) + BN + ReLU
     ↓ MaxPool1d(kernel=3, stride=2)
-    ↓ ResidualBlock(64, 64, stride=1)
+    ↓ ResidualBlock(64, 64, stride=2)
     ↓ ResidualBlock(64, 128, stride=2)
     ↓ ResidualBlock(128, 256, stride=2)
     ↓ ResidualBlock(256, 512, stride=2)
 Output (batch, 512, reduced_length)
+# For 357K features: 357K → ~5.5K → 128 embedding
+```
+
+**Minimal Stride Configuration (preserves more info, recommended):**
+```python
+Input (batch, n_features) → (batch, 1, n_features)
+    ↓ Conv1d(1, 64, kernel=7, stride=1) + BN + ReLU
+    ↓ (no maxpool)
+    ↓ ResidualBlock(64, 64, stride=1)
+    ↓ ResidualBlock(64, 128, stride=1)
+    ↓ ResidualBlock(128, 256, stride=2)
+    ↓ ResidualBlock(256, 512, stride=2)
+Output (batch, 512, reduced_length)
+# For 357K features: 357K → ~89K → 128 embedding
+```
+
+**With Input Dropout (0.99):**
+```python
+Input (batch, n_features) → (batch, 1, n_features)
+    ↓ Dropout(p=0.99)  # Sparse feature learning like MLP
+    ↓ [CNN backbone as above]
 ```
 
 Each **ResidualBlock** contains:

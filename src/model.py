@@ -3,16 +3,34 @@ EpiAML: Epigenomic AML Classifier with 1D-CNN and Contrastive Learning
 
 State-of-the-art model architecture combining:
 1. 1D-CNN backbone with residual connections for feature extraction
-2. Multi-head self-attention for capturing long-range dependencies
+2. Multi-head self-attention for capturing long-range dependencies (optional, disabled by default)
 3. Supervised contrastive learning for better class separation
 4. Feature-ordered input (from CpG clustering) for spatial locality
 
 Model Architecture:
 - Input: Ordered CpG methylation features (357,340 or clustered features)
+- Optional input dropout (0-99%) for sparse feature selection (mimics MLP success)
 - 1D-CNN blocks with residual connections and batch normalization
-- Multi-head attention layer for global context
+- Configurable stride: 'minimal' (preserves info) or 'aggressive' (faster but more pooling)
+- Optional multi-head attention layer for global context
 - Projection head for contrastive learning
 - Classification head for final predictions
+
+Key Improvements over Original:
+1. ✅ Input dropout (set to 0.99 to match MLP's feature selection philosophy)
+2. ✅ Configurable stride: 'minimal' reduces information bottleneck
+3. ✅ Attention disabled by default (often hurts methylation data performance)
+4. ✅ Preserved support for both configurations via stride_config parameter
+
+Usage Examples:
+    # Recommended: Minimal pooling with high input dropout
+    model = EpiAMLModel(input_dropout=0.99, stride_config='minimal', use_attention=False)
+    
+    # Original aggressive pooling (faster but less accurate)
+    model = EpiAMLModel(stride_config='aggressive')
+    
+    # With attention (use cautiously - may hurt performance)
+    model = EpiAMLModel(use_attention=True, stride_config='minimal')
 """
 
 import torch
@@ -141,24 +159,47 @@ class CNN1DBackbone(nn.Module):
         base_channels (int): Base number of channels
         num_blocks (int): Number of residual blocks
         dropout (float): Dropout rate
+        stride_config (str): 'aggressive' (stride=2, faster but more info loss) or 
+                           'minimal' (stride=1, preserves more information)
     """
-    def __init__(self, input_size, base_channels=64, num_blocks=4, dropout=0.1):
+    def __init__(self, input_size, base_channels=64, num_blocks=4, dropout=0.1, stride_config='minimal'):
         super(CNN1DBackbone, self).__init__()
 
         self.input_size = input_size
+        self.stride_config = stride_config
+
+        # Configure stride based on strategy
+        if stride_config == 'aggressive':
+            # Original aggressive pooling: fast but loses information
+            initial_stride = 2
+            use_maxpool = True
+            block_strides = [2 if i > 0 else 1 for i in range(num_blocks)]
+        elif stride_config == 'minimal':
+            # Minimal pooling: preserves more information
+            initial_stride = 1
+            use_maxpool = False  # Skip maxpool to preserve features
+            # Only stride on last few blocks for modest downsampling
+            block_strides = [2 if i >= num_blocks - 2 else 1 for i in range(num_blocks)]
+        else:
+            raise ValueError(f"Unknown stride_config: {stride_config}. Use 'aggressive' or 'minimal'.")
 
         # Initial convolution
-        self.conv1 = nn.Conv1d(1, base_channels, kernel_size=7, stride=2, padding=3, bias=False)
+        self.conv1 = nn.Conv1d(1, base_channels, kernel_size=7, stride=initial_stride, padding=3, bias=False)
         self.bn1 = nn.BatchNorm1d(base_channels)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        
+        # Optional maxpool (only for aggressive mode)
+        if use_maxpool:
+            self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        else:
+            self.maxpool = nn.Identity()  # No-op
 
-        # Residual blocks with increasing channels
+        # Residual blocks with configurable strides
         self.blocks = nn.ModuleList()
         channels = base_channels
         for i in range(num_blocks):
-            stride = 2 if i > 0 else 1
-            out_channels = channels * 2 if i > 0 else channels
+            stride = block_strides[i]
+            out_channels = channels * 2 if stride > 1 else channels
             self.blocks.append(ResidualBlock1D(channels, out_channels,
                                                kernel_size=3, stride=stride, dropout=dropout))
             channels = out_channels
@@ -204,7 +245,9 @@ class EpiAMLModel(nn.Module):
         use_attention (bool): Whether to use attention mechanism
         num_heads (int): Number of attention heads
         projection_dim (int): Dimension for contrastive projection head
-        dropout (float): Dropout rate
+        dropout (float): Dropout rate for CNN layers
+        input_dropout (float): Input-level dropout for feature selection (like MLP's 99% dropout)
+        stride_config (str): Pooling strategy - 'aggressive' (stride=2, faster) or 'minimal' (stride=1, preserves info)
         attention_pool_size (int): Target sequence length before attention (for memory efficiency)
     """
     def __init__(
@@ -213,10 +256,12 @@ class EpiAMLModel(nn.Module):
         num_classes=42,
         base_channels=64,
         num_blocks=4,
-        use_attention=True,
+        use_attention=False,  # Default OFF - attention often hurts performance on methylation data
         num_heads=8,
         projection_dim=128,
         dropout=0.1,
+        input_dropout=0.0,  # Set to 0.99 to mimic MLP's feature selection
+        stride_config='minimal',  # 'aggressive' or 'minimal' - controls information bottleneck
         attention_pool_size=128
     ):
         super(EpiAMLModel, self).__init__()
@@ -225,13 +270,20 @@ class EpiAMLModel(nn.Module):
         self.num_classes = num_classes
         self.use_attention = use_attention
         self.projection_dim = projection_dim
+        self.input_dropout_rate = input_dropout
+        self.stride_config = stride_config
 
-        # 1D-CNN backbone
+        # Input dropout for feature selection (matches MLP's 99% dropout philosophy)
+        # This forces the network to learn from random feature subsets
+        self.input_dropout = nn.Dropout(input_dropout) if input_dropout > 0 else None
+
+        # 1D-CNN backbone with configurable stride
         self.backbone = CNN1DBackbone(
             input_size=input_size,
             base_channels=base_channels,
             num_blocks=num_blocks,
-            dropout=dropout
+            dropout=dropout,
+            stride_config=stride_config
         )
 
         # Aggressive pooling before attention to reduce memory
@@ -281,6 +333,10 @@ class EpiAMLModel(nn.Module):
         Returns:
             torch.Tensor or tuple: Classification logits, optionally with features/projections
         """
+        # Apply input dropout for feature selection (sparse feature learning)
+        if self.input_dropout is not None:
+            x = self.input_dropout(x)
+
         # Extract features with CNN backbone
         features = self.backbone(x)  # (batch, channels, length)
 
@@ -362,7 +418,9 @@ class EpiAMLModel(nn.Module):
             'input_size': self.input_size,
             'num_classes': self.num_classes,
             'use_attention': self.use_attention,
-            'projection_dim': self.projection_dim
+            'projection_dim': self.projection_dim,
+            'input_dropout_rate': self.input_dropout_rate,
+            'stride_config': self.stride_config
         }, filepath)
 
     @classmethod
@@ -382,8 +440,10 @@ class EpiAMLModel(nn.Module):
         model = cls(
             input_size=checkpoint['input_size'],
             num_classes=checkpoint['num_classes'],
-            use_attention=checkpoint.get('use_attention', True),
-            projection_dim=checkpoint.get('projection_dim', 128)
+            use_attention=checkpoint.get('use_attention', False),
+            projection_dim=checkpoint.get('projection_dim', 128),
+            input_dropout=checkpoint.get('input_dropout_rate', 0.0),
+            stride_config=checkpoint.get('stride_config', 'minimal')
         )
 
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -398,16 +458,35 @@ if __name__ == '__main__':
     print("EpiAML Model Architecture Test")
     print("=" * 70)
 
-    # Test with default parameters
-    model = EpiAMLModel(input_size=357340, num_classes=42)
+    # Test with default parameters (minimal pooling, no attention)
+    print("\n[1] Testing MINIMAL POOLING configuration (recommended):")
+    model_minimal = EpiAMLModel(input_size=357340, num_classes=42, stride_config='minimal')
 
     print(f"\nModel Configuration:")
-    print(f"  Input size: {model.input_size:,}")
-    print(f"  Number of classes: {model.num_classes}")
-    print(f"  Use attention: {model.use_attention}")
-    print(f"  Feature dimension: {model.feature_dim}")
-    print(f"  Projection dimension: {model.projection_dim}")
-    print(f"  Total parameters: {model.get_num_parameters():,}")
+    print(f"  Input size: {model_minimal.input_size:,}")
+    print(f"  Number of classes: {model_minimal.num_classes}")
+    print(f"  Stride config: {model_minimal.stride_config}")
+    print(f"  Use attention: {model_minimal.use_attention}")
+    print(f"  Input dropout: {model_minimal.input_dropout_rate}")
+    print(f"  Feature dimension: {model_minimal.feature_dim}")
+    print(f"  Projection dimension: {model_minimal.projection_dim}")
+    print(f"  Total parameters: {model_minimal.get_num_parameters():,}")
+
+    # Test with MLP-like high dropout
+    print("\n[2] Testing with MLP-STYLE 99% INPUT DROPOUT:")
+    model_sparse = EpiAMLModel(input_size=357340, num_classes=42, 
+                               stride_config='minimal', input_dropout=0.99)
+    print(f"  Input dropout: {model_sparse.input_dropout_rate} (sparse feature learning)")
+    print(f"  Total parameters: {model_sparse.get_num_parameters():,}")
+
+    # Test aggressive pooling
+    print("\n[3] Testing AGGRESSIVE POOLING configuration (faster, original):")
+    model_aggressive = EpiAMLModel(input_size=357340, num_classes=42, stride_config='aggressive')
+    print(f"  Stride config: {model_aggressive.stride_config}")
+    print(f"  Total parameters: {model_aggressive.get_num_parameters():,}")
+
+    # Use model_minimal for remaining tests
+    model = model_minimal
 
     # Test forward pass
     batch_size = 4

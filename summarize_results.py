@@ -9,6 +9,9 @@ Fields included:
 - cw (contrastive_weight)
 - do (dropout)
 - nbl (num_blocks)
+- input_dropout (input-level dropout for sparse feature learning)
+- stride_config (pooling strategy: minimal or aggressive)
+- use_attention (whether attention is enabled)
 - best_val_accuracy
 - final_train_accuracy
 - final_val_accuracy
@@ -24,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import pandas as pd
+import numpy as np
 
 def load_experiment(exp_dir: Path):
     """Load config and final metrics from an experiment directory."""
@@ -47,17 +51,36 @@ def load_experiment(exp_dir: Path):
     train_metrics = last_entry.get("train", {})
     val_metrics = last_entry.get("val", {}) or {}
 
+    # Compute Pearson correlation between train and val loss across epochs
+    train_losses = []
+    val_losses = []
+    for entry in history:
+        t_loss = entry.get("train", {}).get("loss")
+        v_loss = entry.get("val", {}).get("loss") if entry.get("val") else None
+        if t_loss is not None and v_loss is not None:
+            train_losses.append(t_loss)
+            val_losses.append(v_loss)
+    if len(train_losses) >= 2 and len(val_losses) == len(train_losses):
+        corr_matrix = np.corrcoef(train_losses, val_losses)
+        corr_train_val_loss = float(corr_matrix[0, 1])
+    else:
+        corr_train_val_loss = None
+
     row = {
         "experiment": exp_dir.name,
         "lr": config.get("learning_rate"),
         "cw": config.get("contrastive_weight"),
         "do": config.get("dropout"),
         "nbl": config.get("num_blocks"),
+        "input_dropout": config.get("input_dropout"),
+        "stride_config": config.get("stride_config"),
+        "use_attention": config.get("use_attention"),
         "best_val_accuracy": config.get("best_val_accuracy"),
         "final_train_accuracy": train_metrics.get("accuracy"),
         "final_val_accuracy": val_metrics.get("accuracy"),
         "final_train_loss": train_metrics.get("loss"),
         "final_val_loss": val_metrics.get("loss"),
+        "corr_train_val_loss": corr_train_val_loss,
     }
     return row
 

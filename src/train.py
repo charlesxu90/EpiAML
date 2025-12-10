@@ -189,6 +189,7 @@ def train_epiaml(
     train_file,
     output_dir,
     feature_order=None,
+    feature_indices=None,
     epochs=500,
     batch_size=32,
     learning_rate=1e-4,
@@ -201,7 +202,9 @@ def train_epiaml(
     temperature=0.07,
     base_channels=64,
     num_blocks=4,
-    use_attention=True,
+    use_attention=False,  # Default OFF - often hurts methylation data
+    input_dropout=0.0,  # Set to 0.99 for MLP-style sparse feature learning
+    stride_config='minimal',  # 'minimal' (preserves info) or 'aggressive' (faster)
     device='cuda',
     random_seed=42,
     save_every=50,
@@ -217,6 +220,7 @@ def train_epiaml(
         train_file (str): Path to training data (.h5 or .csv)
         output_dir (str): Output directory
         feature_order (str): Path to feature order file (optional)
+        feature_indices (str): Path to selected feature indices (.npy, optional for feature selection)
         epochs (int): Number of epochs
         batch_size (int): Batch size
         learning_rate (float): Learning rate
@@ -230,9 +234,15 @@ def train_epiaml(
         base_channels (int): Base channels for CNN
         num_blocks (int): Number of CNN blocks
         use_attention (bool): Whether to use attention
+        input_dropout (float): Input-level dropout for sparse feature learning (0.0-0.99)
+        stride_config (str): Pooling strategy - 'minimal' or 'aggressive'
         device (str): Device ('cuda' or 'cpu')
         random_seed (int): Random seed
         save_every (int): Save checkpoint every N epochs
+        dropout (float): Dropout rate for CNN layers
+        label_smoothing (float): Label smoothing factor
+        mixup_alpha (float): Mixup augmentation alpha
+        early_stopping_patience (int): Early stopping patience
     """
     # Set random seeds
     torch.manual_seed(random_seed)
@@ -256,6 +266,16 @@ def train_epiaml(
 
     print(f"Loaded: {data.shape[0]} samples × {data.shape[1]} features")
     print(f"Classes: {len(np.unique(labels))}")
+    
+    # Apply feature selection if indices provided
+    if feature_indices is not None and os.path.exists(feature_indices):
+        print(f"\nApplying feature selection from {feature_indices}...")
+        selected_indices = np.load(feature_indices)
+        data = data[:, selected_indices]
+        if feature_names is not None:
+            feature_names = feature_names[selected_indices]
+        print(f"After feature selection: {data.shape[0]} samples × {data.shape[1]} features")
+        print(f"  Selected {len(selected_indices)} most informative CpGs")
 
     # Split train/val
     if val_split > 0:
@@ -302,17 +322,22 @@ def train_epiaml(
         base_channels=base_channels,
         num_blocks=num_blocks,
         use_attention=use_attention,
-        dropout=dropout  # Use configurable dropout
+        dropout=dropout,  # Use configurable dropout
+        input_dropout=input_dropout,  # Sparse feature learning
+        stride_config=stride_config  # Pooling strategy
     ).to(device)
 
     epiaml_params = model.get_num_parameters()
-    print(f"\nEpiAML (EpiAML/):")
+    print(f"\nEpiAML Model Configuration:")
     print(f"  Architecture: 1D-CNN + Attention + Contrastive Learning")
     print(f"  Input size: {input_size:,}")
     print(f"  Number of classes: {num_classes}")
     print(f"  Base channels: {base_channels}")
     print(f"  CNN blocks: {num_blocks}")
     print(f"  Use attention: {use_attention}")
+    print(f"  Input dropout: {input_dropout} {'(sparse feature learning)' if input_dropout > 0.5 else ''}")
+    print(f"  Stride config: {stride_config}")
+    print(f"  CNN dropout: {dropout}")
     print(f"  Total parameters: {epiaml_params:,}")
     print(f"  Model size: ~{epiaml_params * 4 / (1024**2):.2f} MB")
 
@@ -337,6 +362,7 @@ def train_epiaml(
     print(f"\nStarting training for {epochs} epochs...")
     print(f"Batch size: {batch_size}, Learning rate: {learning_rate}")
     print(f"Contrastive weight: {contrastive_weight}, Temperature: {temperature}")
+    print(f"Model config: stride_config={stride_config}, input_dropout={input_dropout}")
     print(f"Regularization: dropout={dropout}, label_smoothing={label_smoothing}, mixup_alpha={mixup_alpha}")
     print(f"Early stopping patience: {early_stopping_patience}")
 
@@ -480,6 +506,11 @@ def train_epiaml(
         'base_channels': base_channels,
         'num_blocks': num_blocks,
         'use_attention': use_attention,
+        'input_dropout': input_dropout,
+        'stride_config': stride_config,
+        'dropout': dropout,
+        'label_smoothing': label_smoothing,
+        'mixup_alpha': mixup_alpha,
         'training_time': round(total_time, 2),
         'best_val_accuracy': round(best_val_acc, 4) if val_metrics else None,
         'final_train_accuracy': round(train_metrics['accuracy'], 4),
@@ -514,10 +545,24 @@ def main():
 EpiAML combines 1D-CNN backbone, multi-head attention, and supervised
 contrastive learning for accurate leukemia subtype classification.
 
-Example:
+Examples:
+  # Recommended: MLP-style with sparse features (99% input dropout)
   python train.py --train_file ../pytorch_marlin/data/training_data.h5 \\
-                  --output_dir ./output \\
-                  --feature_order ../cluster_output/feature_order.npy \\
+                  --output_dir ./output_mlp_style \\
+                  --input_dropout 0.99 --stride_config minimal --no_attention \\
+                  --epochs 500 --batch_size 32
+  
+  # With feature selection (fewer CpG sites)
+  python train.py --train_file ../pytorch_marlin/data/training_data.h5 \\
+                  --feature_indices ./feature_selection/top_100_cpg_indices.npy \\
+                  --output_dir ./output_top100cpg \\
+                  --input_dropout 0.0 --stride_config minimal --no_attention \\
+                  --epochs 300 --batch_size 32
+  
+  # Original CNN configuration
+  python train.py --train_file ../pytorch_marlin/data/training_data.h5 \\
+                  --output_dir ./output_cnn \\
+                  --stride_config aggressive \\
                   --epochs 500 --batch_size 32
 
 Monitor training:
@@ -531,6 +576,8 @@ Monitor training:
                         help='Output directory (default: ./output)')
     parser.add_argument('--feature_order', default=None,
                         help='Path to feature order file (.npy, .json, .txt)')
+    parser.add_argument('--feature_indices', default=None,
+                        help='Path to selected feature indices (.npy, from feature selection)')
 
     # Training parameters
     parser.add_argument('--epochs', type=int, default=500,
@@ -565,6 +612,11 @@ Monitor training:
                         help='Number of CNN blocks (default: 4)')
     parser.add_argument('--no_attention', action='store_true',
                         help='Disable attention mechanism')
+    parser.add_argument('--input_dropout', type=float, default=0.0,
+                        help='Input-level dropout for sparse feature learning (0.0-0.99, default: 0.0)')
+    parser.add_argument('--stride_config', type=str, default='minimal',
+                        choices=['minimal', 'aggressive'],
+                        help='Pooling strategy: minimal (preserves info) or aggressive (faster, default: minimal)')
 
     # Regularization (to prevent overfitting)
     parser.add_argument('--dropout', type=float, default=0.3,
@@ -591,6 +643,7 @@ Monitor training:
         train_file=args.train_file,
         output_dir=args.output_dir,
         feature_order=args.feature_order,
+        feature_indices=args.feature_indices,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -604,6 +657,8 @@ Monitor training:
         base_channels=args.base_channels,
         num_blocks=args.num_blocks,
         use_attention=not args.no_attention,
+        input_dropout=args.input_dropout,
+        stride_config=args.stride_config,
         device=args.device,
         random_seed=args.seed,
         save_every=args.save_every,

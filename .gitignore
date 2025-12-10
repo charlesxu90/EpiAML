@@ -77,5 +77,4 @@ data/
 .vscode/
 .claude/
 .gemini/
-output_search/
-cluster_output/
+results/

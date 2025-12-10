@@ -17,6 +17,7 @@ def predict_batch(
     input_file,
     output_file,
     feature_order=None,
+    feature_indices=None,
     class_mapping=None,
     batch_size=32,
     device='cuda'
@@ -29,6 +30,7 @@ def predict_batch(
         input_file (str): Path to input data (.h5 or .csv)
         output_file (str): Path to output CSV file
         feature_order (str): Path to feature order file
+        feature_indices (str): Path to selected feature indices (.npy)
         class_mapping (str): Path to class mapping CSV
         batch_size (int): Batch size for prediction
         device (str): Device ('cuda' or 'cpu')
@@ -56,6 +58,15 @@ def predict_batch(
     )
 
     print(f"  Loaded: {data.shape[0]} samples × {data.shape[1]} features")
+    
+    # Apply feature selection if indices provided
+    if feature_indices is not None and os.path.exists(feature_indices):
+        print(f"Applying feature selection from {feature_indices}...")
+        selected_indices = np.load(feature_indices)
+        data = data[:, selected_indices]
+        if feature_names is not None:
+            feature_names = feature_names[selected_indices]
+        print(f"  After feature selection: {data.shape[0]} samples × {data.shape[1]} features")
 
     # Load class mapping if provided
     class_names = None
@@ -331,6 +342,8 @@ Examples:
 
     parser.add_argument('--feature_order', default=None,
                         help='Path to feature order file (.npy, .json, .txt)')
+    parser.add_argument('--feature_indices', default=None,
+                        help='Path to selected feature indices (.npy, from feature selection)')
     parser.add_argument('--class_mapping', default=None,
                         help='Path to class mapping CSV')
 
@@ -384,6 +397,7 @@ Examples:
             input_file=args.input_file,
             output_file=args.output_file,
             feature_order=args.feature_order,
+            feature_indices=args.feature_indices,
             class_mapping=args.class_mapping,
             batch_size=args.batch_size,
             device=args.device

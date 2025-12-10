@@ -68,30 +68,15 @@ python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 Feature ordering via clustering improves 1D-CNN performance by ensuring similar CpG sites are spatially adjacent:
 
 ```bash
-# Find optimal number of clusters
-python cluster_cg.py \
-    --data ../pytorch_marlin/data/training_data.h5 \
-    --find_optimal \
-    --k_min 20 \
-    --k_max 300 \
-    --k_step 20 \
-    --output_dir ./cluster_output \
-    --gpu
-
-# Run clustering with optimal k (e.g., k=100)
-python cluster_cg.py \
-    --data ../pytorch_marlin/data/training_data.h5 \
-    --n_clusters 100 \
-    --output_dir ./cluster_output \
-    --gpu
+# Create a small dataset for debugging purpose
+python create_debug_data.py --input ../pytorch_marlin/data/training_data.h5 --output data/training_data_debug.h5
 ```
 
-**Output Files:**
-- `feature_order.npy` - Ordered feature indices (use this for training)
-- `feature_order.json` - Ordered feature names
-- `feature_tsne_clusters.png` - Visualization of clusters
-- `clustering_results.json` - Clustering metrics
+```bash
+python get_feature_orders.py --data data/training_data_debug.h5 --output_dir ./feature_order_debug
 
+python get_feature_orders.py --data ../pytorch_marlin/data/training_data.h5
+```
 ### 2. Train EpiAML Model
 
 ```bash

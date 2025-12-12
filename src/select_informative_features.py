@@ -2,7 +2,7 @@
 Feature Selection for AML Classification using SHAP
 
 Use SHAP (SHapley Additive exPlanations) to identify the most informative 
-CpG sites from a trained model. SHAP extracts which features the model 
+CpG sites from a trained MARLIN model. SHAP extracts which features the model 
 actually uses for predictions.
 
 For a 100% accurate model, SHAP-selected features are guaranteed to be 
@@ -14,9 +14,7 @@ import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Tuple, Dict, List
 import torch
-import torch.nn as nn
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
@@ -29,9 +27,26 @@ except ImportError:
     HAS_SHAP = False
     print("ERROR: SHAP is required. Install with: pip install shap")
 
+# Import EpiAML data_utils first (before adding MARLIN path)
 from data_utils import load_training_data
 
-def compute_shap_importance(X_train, y_train, model_path, device='cuda', sample_size=500, background_samples=100, cache_dir=None):
+# Import MARLIN model
+import sys
+marlin_src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'pytorch_marlin', 'src')
+if marlin_src not in sys.path:
+    sys.path.insert(0, marlin_src)
+from model import MARLINModel
+
+def compute_shap_importance(
+    X_train,
+    y_train,
+    model_path,
+    device='cuda',
+    sample_size=500,
+    background_samples=100,
+    cache_dir=None,
+    prefilter_topk: int = 5000,
+):
     """
     Compute SHAP-based feature importance using trained PyTorch model.
     
@@ -49,6 +64,7 @@ def compute_shap_importance(X_train, y_train, model_path, device='cuda', sample_
         sample_size (int): Number of samples to explain (for computational efficiency)
         background_samples (int): Number of background samples for SHAP baseline
         cache_dir (str): Directory to cache per-class SHAP results. If None, caching is disabled.
+        prefilter_topk (int): Pre-filter features by variance before SHAP (0 disables)
     
     Returns:
         np.ndarray: SHAP importance scores for each feature (normalized 0-1)
@@ -94,40 +110,13 @@ def compute_shap_importance(X_train, y_train, model_path, device='cuda', sample_
         os.makedirs(cache_dir, exist_ok=True)
         print(f"\nUsing cache directory: {cache_dir}")
     
-    # Load model - detect type from checkpoint
-    print(f"\nLoading model from {model_path}...")
-    try:
-        checkpoint = torch.load(model_path, map_location='cpu')
-        
-        # Detect model type from checkpoint keys
-        if 'num_classes' in checkpoint:
-            # EpiAML model format
-            import sys
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from model import EpiAMLModel
-            model = EpiAMLModel.load_model(model_path, device=str(device))
-            print(f"✓ Model loaded successfully (EpiAMLModel)")
-            
-        elif 'output_size' in checkpoint:
-            # MARLIN model format
-            import sys
-            marlin_src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'pytorch_marlin', 'src')
-            if marlin_src not in sys.path:
-                sys.path.insert(0, marlin_src)
-            from model import MARLINModel
-            model = MARLINModel.load_model(model_path, device=str(device))
-            print(f"✓ Model loaded successfully (MARLINModel)")
-            
-        else:
-            raise RuntimeError(f"Unknown model format. Checkpoint keys: {list(checkpoint.keys())}")
-        
-        model.eval()
-        print(f"  Input size: {X_train.shape[1]:,} features")
-        print(f"  Output classes: {len(np.unique(y_train))}")
-        
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        raise
+    # Load MARLIN model
+    print(f"\nLoading MARLIN model from {model_path}...")
+    model = MARLINModel.load_model(model_path, device=str(device))
+    model.eval()
+    print(f"✓ Model loaded successfully")
+    print(f"  Input size: {X_train.shape[1]:,} features")
+    print(f"  Output classes: {len(np.unique(y_train))}")
     
     # Prepare data
     n_samples, n_features = X_train.shape
@@ -148,93 +137,130 @@ def compute_shap_importance(X_train, y_train, model_path, device='cuda', sample_
     
     background_indices = np.random.choice(n_samples, size=background_samples, replace=False)
     X_background = X_train[background_indices]
+
+    # Optional pre-filtering to shrink feature space (variance-based)
+    prefilter_indices = None
+    if prefilter_topk and prefilter_topk > 0 and prefilter_topk < n_features:
+        variances = X_train.var(axis=0)
+        prefilter_indices = np.argsort(variances)[-prefilter_topk:]
+        X_sample = X_sample[:, prefilter_indices]
+        X_background = X_background[:, prefilter_indices]
+        n_features_pref = X_sample.shape[1]
+        print(f"Prefilter enabled: top {prefilter_topk} variance features (down from {n_features:,} to {n_features_pref:,})")
+
+    def pad_to_full(x_subset: np.ndarray) -> np.ndarray:
+        """Pad prefiltered features back to full dimension for model input."""
+        if prefilter_indices is None:
+            return x_subset
+        full = np.zeros((x_subset.shape[0], n_features), dtype=x_subset.dtype)
+        full[:, prefilter_indices] = x_subset
+        return full
     
     # Get number of classes
     n_classes_model = len(np.unique(y_train.astype(int)))
     print(f"Number of classes in model: {n_classes_model}")
     
-    # Create prediction function wrapper for each class with GPU support
-    def create_predict_fn(class_idx):
-        """Create wrapper for SHAP to call model predictions for a specific class (GPU-accelerated)"""
-        def predict_fn(x):
-            if len(x.shape) == 1:
-                x = x.reshape(1, -1)
-            
-            # Use GPU for tensor operations if available
-            x_tensor = torch.FloatTensor(x).to(device)
-            
-            # Add channel dimension if needed (for 1D-CNN)
-            if len(x_tensor.shape) == 2:
-                x_tensor = x_tensor.unsqueeze(1)
-            
-            with torch.no_grad():
-                logits = model(x_tensor)
-                probs = torch.softmax(logits, dim=1)
-            
-            # Return probabilities for this class only (shape: (n_samples,))
-            # Detach, move to CPU, and convert to numpy
-            return probs[:, class_idx].detach().cpu().numpy()
+    # KernelExplainer with multi-output support
+    # Strategy: Compute SHAP for all classes at once (much faster than per-class loop)
+    
+    print("\nUsing KernelExplainer (multi-output SHAP)")
+    print(f"  Computing SHAP for all {n_classes_model} classes simultaneously")
+    print(f"  This is ~{n_classes_model}x faster than per-class computation!")
+
+    # Create prediction function that returns all class probabilities
+    def predict_fn_all_classes(x):
+        """
+        Prediction function for all classes.
+        MARLIN model outputs softmax probabilities for all classes.
+        Returns shape: (batch_size, n_classes)
+        """
+        if len(x.shape) == 1:
+            x = x.reshape(1, -1)
+        # Pad back to full dimension if needed
+        x_full = pad_to_full(np.asarray(x))
         
-        return predict_fn
-    
-    # Test prediction function on first class
-    print("\nTesting prediction function (GPU)...")
-    test_pred_fn = create_predict_fn(0)
-    test_pred = test_pred_fn(X_sample[:2])
+        # MARLIN expects (batch_size, n_features)
+        x_tensor = torch.as_tensor(x_full, dtype=torch.float32, device=device)
+        
+        with torch.no_grad():
+            probs_all = model(x_tensor)  # shape: (batch_size, n_classes)
+        
+        return probs_all.detach().cpu().numpy()
+
+    # Test prediction function
+    print("\nTesting prediction function...")
+    test_pred = predict_fn_all_classes(X_sample[:2])
     print(f"✓ Prediction shape: {test_pred.shape}")
+    print(f"✓ Output format: (batch_size={test_pred.shape[0]}, n_classes={test_pred.shape[1]})")
     print(f"✓ Prediction range: [{test_pred.min():.4f}, {test_pred.max():.4f}]")
-    print(f"✓ GPU acceleration enabled for inference")
-    
-    # Initialize KernelExplainer
+
     print("\n" + "="*70)
-    print("Computing SHAP Values (GPU-Accelerated)")
+    print("Computing SHAP Values (All Classes at Once)")
     print("="*70)
-    print("This may take several minutes...")
-    print(f"Explaining {sample_size} samples with {n_features:,} features")
-    print(f"Computing across {n_classes_model} classes...")
     
-    # Aggregate SHAP importance across all classes
-    shap_importance = np.zeros(n_features)
+    # Check if cached results exist
+    cache_file = None
+    shap_values_all = None
+    if cache_dir is not None:
+        cache_file = os.path.join(cache_dir, 'shap_all_classes.npy')
+        if os.path.exists(cache_file):
+            print("Loading cached SHAP values...")
+            shap_values_all = np.load(cache_file)
+            print(f"✓ Loaded from cache: {cache_file}")
+            print(f"  SHAP values shape: {shap_values_all.shape}")
     
-    # Outer progress bar for classes
-    with tqdm(total=n_classes_model, desc="Classes", unit="class") as pbar_class:
-        for class_idx in range(n_classes_model):
-            # Check if cached result exists
-            cache_file = None
-            class_shap_values = None
-            
-            if cache_dir is not None:
-                cache_file = os.path.join(cache_dir, f'shap_class_{class_idx}.npy')
-                if os.path.exists(cache_file):
-                    # Load from cache
-                    class_shap_values = np.load(cache_file)
-                    pbar_class.set_description(f"Classes (cached: {class_idx})")
-            
-            if class_shap_values is None:
-                # Compute SHAP values for this class
-                # Create prediction function for this class
-                predict_fn = create_predict_fn(class_idx)
-                
-                # Create explainer for this class
-                # Note: KernelExplainer will internally use the model on GPU for predictions
-                explainer = shap.KernelExplainer(predict_fn, X_background)
-                
-                # Compute SHAP values for this class (shape: n_samples, n_features)
-                # The nsamples parameter controls SHAP's internal accuracy/speed tradeoff
-                class_shap_values = explainer.shap_values(X_sample, nsamples=100)
-                
-                # Save to cache if enabled
-                if cache_file is not None:
-                    np.save(cache_file, class_shap_values)
-                    pbar_class.set_description(f"Classes (saved cache: {class_idx})")
-            
-            # Add to importance (mean absolute values)
-            shap_importance += np.abs(class_shap_values).mean(axis=0)
-            
-            pbar_class.update(1)
+    if shap_values_all is None:
+        print("Computing SHAP values (this may take several minutes)...")
+        print(f"  Samples to explain: {sample_size}")
+        print(f"  Features: {X_sample.shape[1]:,}")
+        print(f"  Classes: {n_classes_model}")
+        
+        # Use subset of background for faster baseline computation
+        bg_subset = X_background[:min(20, len(X_background))]
+        print(f"  Background samples: {len(bg_subset)}")
+        
+        # Initialize KernelExplainer with multi-output function
+        explainer = shap.KernelExplainer(predict_fn_all_classes, bg_subset)
+        
+        # Compute SHAP values for all outputs at once
+        print("\nRunning SHAP explainer...")
+        shap_values_all = explainer.shap_values(X_sample, nsamples=100)
+        
+        # Handle return format: list of arrays (one per class) or 3D array
+        if isinstance(shap_values_all, list):
+            # List of (n_samples, n_features) arrays, one per class
+            print(f"  Raw output: list of {len(shap_values_all)} arrays, each shape {shap_values_all[0].shape}")
+            shap_values_all = np.array(shap_values_all)  # (n_classes, n_samples, n_features)
+            shap_values_all = np.transpose(shap_values_all, (1, 2, 0))  # (n_samples, n_features, n_classes)
+        
+        print(f"✓ SHAP computation complete")
+        print(f"  Final shape: {shap_values_all.shape}")
+        
+        # Save to cache
+        if cache_file is not None:
+            np.save(cache_file, shap_values_all)
+            print(f"✓ Saved to cache: {cache_file}")
+
+    # Aggregate SHAP values across all classes and samples
+    print("\nAggregating SHAP importance...")
     
-    # Average across classes
-    shap_importance /= n_classes_model
+    if shap_values_all.ndim == 3:
+        # Shape: (n_samples, n_features, n_classes)
+        shap_importance_pref = np.abs(shap_values_all).mean(axis=(0, 2))  # (n_features,)
+    elif shap_values_all.ndim == 2:
+        # Shape: (n_samples, n_features) - single output case
+        shap_importance_pref = np.abs(shap_values_all).mean(axis=0)
+    else:
+        raise ValueError(f"Unexpected SHAP values shape: {shap_values_all.shape}")
+    
+    print(f"✓ Aggregation complete: {shap_importance_pref.shape}")
+
+    # Map back to full feature space if prefiltered
+    if prefilter_indices is not None:
+        shap_importance = np.zeros(n_features)
+        shap_importance[prefilter_indices] = shap_importance_pref
+    else:
+        shap_importance = shap_importance_pref
     
     # Normalize to [0, 1]
     shap_importance = (shap_importance - shap_importance.min()) / (shap_importance.max() - shap_importance.min() + 1e-10)
@@ -329,7 +355,7 @@ def save_results(
     print("\nSaving complete feature scores...")
     all_scores_list = []
     total_features = len(shap_scores)
-    with tqdm(total=total_features, desc="All features", unit="feat") as pbar:
+    with tqdm(total=total_features, desc="All features", unit="feat", ncols=80) as pbar:
         for idx in range(total_features):
             row = {
                 'feature_index': idx,
@@ -455,10 +481,12 @@ Examples:
                         help='Number of top features to select (default: 100)')
     parser.add_argument('--device', default='cuda:1',
                         help='Device for model inference (default: cuda:1). Examples: cuda, cuda:0, cuda:1, cpu')
-    parser.add_argument('--shap_samples', type=int, default=500,
-                        help='Number of samples for SHAP explanation (default: 500, more=better but slower)')
-    parser.add_argument('--shap_background', type=int, default=100,
-                        help='Number of background samples for SHAP baseline (default: 100)')
+    parser.add_argument('--shap_samples', type=int, default=200,
+                        help='Number of samples for SHAP explanation (default: 200, smaller = faster)')
+    parser.add_argument('--shap_background', type=int, default=50,
+                        help='Number of background samples for SHAP baseline (default: 50, smaller = faster)')
+    parser.add_argument('--prefilter_topk', type=int, default=5000,
+                        help='Pre-filter to top-K variance features before SHAP (0 to disable, default: 5000)')
     
     args = parser.parse_args()
     
@@ -493,7 +521,7 @@ Examples:
     print(f"Data file: {args.train_file}")
     
     print("\nLoading and processing data...")
-    with tqdm(total=3, desc="Data Loading", unit="step") as pbar:
+    with tqdm(total=3, desc="Data Loading", unit="step", ncols=80) as pbar:
         X_train, y_train, feature_names = load_training_data(
             args.train_file,
             format='auto',
@@ -521,7 +549,8 @@ Examples:
         device=args.device,
         sample_size=args.shap_samples,
         background_samples=args.shap_background,
-        cache_dir=cache_dir
+        cache_dir=cache_dir,
+        prefilter_topk=args.prefilter_topk,
     )
     
     # Select top features

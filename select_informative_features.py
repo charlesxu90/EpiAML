@@ -27,14 +27,32 @@ except ImportError:
     HAS_SHAP = False
     print("ERROR: SHAP is required. Install with: pip install shap")
 
-# Import EpiAML data_utils first (before adding MARLIN path)
-from data_utils import load_training_data
-
-# Import MARLIN model
+# Import MARLIN model and data utilities
 import sys
-marlin_src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'pytorch_marlin', 'src')
+
+# Get the directory containing this script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Add pytorch_marlin/src to path (works whether script is in EpiAML/ or EpiAML/src/)
+possible_marlin_paths = [
+    os.path.join(script_dir, '..', 'pytorch_marlin', 'src'),  # If in EpiAML/
+    os.path.join(script_dir, '..', '..', 'pytorch_marlin', 'src'),  # If in EpiAML/src/
+]
+
+marlin_src = None
+for path in possible_marlin_paths:
+    abs_path = os.path.abspath(path)
+    if os.path.exists(abs_path):
+        marlin_src = abs_path
+        break
+
+if marlin_src is None:
+    raise ImportError(f"Cannot find pytorch_marlin/src directory. Searched: {possible_marlin_paths}")
+
 if marlin_src not in sys.path:
     sys.path.insert(0, marlin_src)
+
+from data_utils_fast import load_training_data
 from model import MARLINModel
 
 def compute_shap_importance(

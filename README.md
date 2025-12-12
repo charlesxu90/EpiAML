@@ -72,19 +72,18 @@ python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
 
 ## Quick Start
 
-### 1. Prepare Feature Ordering (Optional but Recommended)
-
-Feature ordering via clustering improves 1D-CNN performance by ensuring similar CpG sites are spatially adjacent:
+### 1. Create a debug dataset for efficient evalution
 
 ```bash
 # Create a small dataset for debugging purpose
 python create_debug_data.py --input ../pytorch_marlin/data/training_data.h5 --output data/training_data_debug.h5
 ```
 
+### 2. Feature selection with Shapley analysis
 ```bash
-python get_feature_orders.py --data data/training_data_debug.h5 --output_dir ./feature_order_debug --gpu
+python select_informative_features.py  --train_file  ../pytorch_marlin/data/training_data.h5  --model_path ../pytorch_marlin/output/marlin_model.pt   --device cuda:0 --output_dir ./feature_selection_shap  --n_features 1000  --prefilter_topk 5000
 
-python get_feature_orders.py --data ../pytorch_marlin/data/training_data.h5 --output_dir ./feature_order --gpu
+python select_informative_features.py --train_file  data/training_data_debug.h5 --model_path ../pytorch_marlin/output_sample/marlin_model.pt --device cuda:1 --output_dir ./feature_selection_shap_sample  --n_features 1000  --prefilter_topk 5000
 ```
 ### 2. Train EpiAML Model
 

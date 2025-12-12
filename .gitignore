@@ -78,3 +78,5 @@ data/
 .claude/
 .gemini/
 results/
+figures/
+feature_selection_*/

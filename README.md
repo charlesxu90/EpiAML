@@ -84,8 +84,10 @@ python create_debug_data.py --input ../pytorch_marlin/data/training_data.h5 --ou
 python select_informative_features.py  --train_file  ../pytorch_marlin/data/training_data.h5  --model_path ../pytorch_marlin/output/marlin_model.pt   --device cuda:0 --output_dir ./feature_selection_shap  --n_features 1000  --prefilter_topk 5000
 
 python select_informative_features.py --train_file  data/training_data_debug.h5 --model_path ../pytorch_marlin/output_sample/marlin_model.pt --device cuda:1 --output_dir ./feature_selection_shap_sample  --n_features 1000  --prefilter_topk 5000
+
+python select_informative_features.py  --train_file  ../pytorch_marlin/data/training_data.h5  --model_path ../pytorch_marlin/output/marlin_model.pt   --device cuda:1 --output_dir ./feature_selection_shap_5k  --n_features 5000  --prefilter_topk 10000 --shap_samples 500 --shap_background 100
 ```
-### 2. Train EpiAML Model
+### 2. Train EpiAML Model with selected features
 
 **Recommended: MLP-style with sparse feature learning (best for methylation data):**
 ```bash

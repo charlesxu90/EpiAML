@@ -86,7 +86,25 @@ python select_informative_features.py  --train_file  ../pytorch_marlin/data/trai
 python select_informative_features.py --train_file  data/training_data_debug.h5 --model_path ../pytorch_marlin/output_sample/marlin_model.pt --device cuda:1 --output_dir ./feature_selection_shap_sample  --n_features 1000  --prefilter_topk 5000
 
 python select_informative_features.py  --train_file  ../pytorch_marlin/data/training_data.h5  --model_path ../pytorch_marlin/output/marlin_model.pt   --device cuda:1 --output_dir ./feature_selection_shap_5k  --n_features 5000  --prefilter_topk 10000 --shap_samples 500 --shap_background 100
+
+python select_informative_features.py  --train_file  ../pytorch_marlin/data/training_data.h5  --model_path ../pytorch_marlin/output/marlin_model.pt   --device cuda:1 --output_dir ./feature_selection_shap_10k  --n_features 10000  --prefilter_topk 100000 --shap_samples 500 --shap_background 100
+
+python select_informative_features.py  --train_file  ../pytorch_marlin/data/training_data.h5  --model_path ../pytorch_marlin/output/marlin_model.pt   --device cuda:1 --output_dir ./feature_selection_shap_50k  --n_features 50000  --prefilter_topk 1000000 --shap_samples 500 --shap_background 100
 ```
+
+### 3. Create small dataset with selected features
+```bash
+python create_filtered_dataset.py --input_data ../pytorch_marlin/data/training_data.h5 --feature_selection_dir ./feature_selection_shap_sample --output_data ./feature_selection_shap_sample/training_data_top1000.h5 --n_features 1000
+
+python create_filtered_dataset.py --input_data ../pytorch_marlin/data/training_data.h5 --feature_selection_dir ./feature_selection_shap --output_data ./feature_selection_shap/training_data_top1000.h5 --n_features 1000
+
+python create_filtered_dataset.py --input_data ../pytorch_marlin/data/training_data.h5 --feature_selection_dir ./feature_selection_shap_5k --output_data ./feature_selection_shap_5k/training_data_top5000.h5 --n_features 5000
+
+python create_filtered_dataset.py --input_data ../pytorch_marlin/data/training_data.h5 --feature_selection_dir ./feature_selection_shap_10k --output_data ./feature_selection_shap_10k/training_data_top10000.h5 --n_features 10000
+
+python create_filtered_dataset.py --input_data ../pytorch_marlin/data/training_data.h5 --feature_selection_dir ./feature_selection_shap_50k --output_data ./feature_selection_shap_50k/training_data_top50000.h5 --n_features 50000
+```
+
 ### 2. Train EpiAML Model with selected features
 
 **Recommended: MLP-style with sparse feature learning (best for methylation data):**
